@@ -6,179 +6,154 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "*",
 };
 
-// Helper: Generate short ID for logs
 const generateId = () => Math.random().toString(36).substring(2, 6);
 
-// Helper: Safe Write with Logging
-async function safeWrite(
-  writer: WritableStreamDefaultWriter, 
-  data: Uint8Array, 
-  reqId: string, 
-  context: string
-) {
-  try {
-    await writer.ready;
-    await writer.write(data);
-    return true;
-  } catch (e: any) {
-    // Log the EXACT error causing the break
-    console.warn(`[${reqId}] ⚠️ Write failed during ${context}: ${e.name} - ${e.message}`);
-    return false;
+// --- MUTEX LOCK ---
+// Prevents Heartbeat and Data from writing simultaneously
+class StreamLock {
+  private _lock: Promise<void> = Promise.resolve();
+
+  async run<T>(task: () => Promise<T>): Promise<T | null> {
+    const currentLock = this._lock;
+    let release: () => void;
+    
+    // Create a new lock promise
+    this._lock = new Promise((resolve) => { release = resolve; });
+
+    // Wait for previous task to finish
+    await currentLock;
+
+    try {
+      return await task();
+    } finally {
+      // Release the lock for the next task
+      release!();
+    }
   }
 }
 
 serve(async (req: Request) => {
   const reqId = generateId();
-  const startTime = Date.now();
-
-  // 1. Handle CORS
+  
+  // 1. CORS
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: CORS_HEADERS });
   }
 
   try {
     const url = new URL(req.url);
-    console.log(`[${reqId}] 🚀 Incoming Request: ${req.method} ${url.pathname}`);
+    // console.log(`[${reqId}] 🚀 Request: ${req.method} ${url.pathname}`);
 
-    // 2. Path Fix
+    // 2. Path & Headers
     let targetPath = url.pathname;
-    if (targetPath.startsWith("/models")) {
-      targetPath = "/v1beta" + targetPath;
-    }
+    if (targetPath.startsWith("/models")) targetPath = "/v1beta" + targetPath;
     
     const targetUrl = new URL(targetPath + url.search, "https://generativelanguage.googleapis.com");
-    
-    // 3. Force SSE
-    if (!targetUrl.searchParams.has("alt")) {
-      targetUrl.searchParams.set("alt", "sse");
-    }
+    if (!targetUrl.searchParams.has("alt")) targetUrl.searchParams.set("alt", "sse");
 
     const newHeaders = new Headers(req.headers);
     newHeaders.set("Host", "generativelanguage.googleapis.com");
-    newHeaders.delete("x-forwarded-for"); 
-    
-    // Log important headers from client
-    // console.log(`[${reqId}] Client Headers:`, JSON.stringify(Object.fromEntries(newHeaders.entries())));
+    newHeaders.delete("x-forwarded-for");
 
-    // 4. Fetch from Google
-    let bodyText: string | null = null;
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      bodyText = await req.text();
-    }
-
-    console.log(`[${reqId}] ⏳ Connecting to Google...`);
-    
-    let response;
-    try {
-      response = await fetch(targetUrl, {
-        method: req.method,
-        headers: newHeaders,
-        body: bodyText,
-      });
-    } catch (fetchErr) {
-      console.error(`[${reqId}] ❌ Fetch Network Error:`, fetchErr);
-      throw fetchErr;
-    }
-
-    console.log(`[${reqId}] ✅ Google Status: ${response.status} ${response.statusText}`);
-    
-    // Check if Google refused to stream
-    const contentType = response.headers.get("content-type");
-    console.log(`[${reqId}] Upstream Content-Type: ${contentType}`);
+    // 3. Fetch Google
+    // console.log(`[${reqId}] ⏳ Connecting upstream...`);
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers: newHeaders,
+      body: req.method !== "GET" && req.method !== "HEAD" ? await req.text() : null,
+    });
 
     if (!response.ok) {
-       const errorText = await response.text();
-       console.error(`[${reqId}] ❌ Google Error Body:`, errorText);
-       return new Response(errorText, { status: response.status, headers: CORS_HEADERS });
+      console.error(`[${reqId}] ❌ Google Error: ${response.status}`);
+      return new Response(await response.text(), { status: response.status, headers: CORS_HEADERS });
     }
 
-    // 5. Setup Pipeline
+    // 4. Setup Stream & Lock
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
+    const lock = new StreamLock();
 
-    // 6. Background Streaming Process
+    // Helper: Locked Safe Write
+    const safeWrite = async (data: Uint8Array, context: string) => {
+      // If client already disconnected (AbortSignal), don't bother writing
+      if (req.signal.aborted) return false;
+
+      return await lock.run(async () => {
+        try {
+          await writer.ready;
+          await writer.write(data);
+          return true;
+        } catch (e: any) {
+          // Ignore standard disconnect errors to keep logs clean
+          if (e.message.includes("response already completed") || 
+              e.message.includes("BadResource") || 
+              e.message.includes("Broken pipe")) {
+            // console.log(`[${reqId}] ℹ️ Client disconnected (${context})`);
+          } else {
+            console.warn(`[${reqId}] ⚠️ Write Error (${context}): ${e.message}`);
+          }
+          return false;
+        }
+      });
+    };
+
+    // 5. Background Process
     (async () => {
-      let heartbeatInterval;
-      let chunkCount = 0;
-      let totalBytes = 0;
+      const reader = response.body?.getReader();
+      if (!reader) {
+        await writer.close();
+        return;
+      }
+
+      // Heartbeat Interval
+      const heartbeat = setInterval(async () => {
+        if (req.signal.aborted) {
+           clearInterval(heartbeat);
+           return;
+        }
+        // Keep-alive comment
+        const success = await safeWrite(encoder.encode(`: keep-alive ${Date.now()}\n\n`), "Heartbeat");
+        if (!success) clearInterval(heartbeat);
+      }, 8000); // 8 seconds (faster than typical 10-15s timeouts)
 
       try {
-        const reader = response.body?.getReader();
-        if (!reader) {
-          console.error(`[${reqId}] ❌ No response body from Google`);
-          await writer.close();
-          return;
-        }
+        // Send Start
+        if (!await safeWrite(encoder.encode(": start\n\n"), "Init")) return;
 
-        // Initial Signal
-        if (!await safeWrite(writer, encoder.encode(": start\n\n"), reqId, "Init")) return;
-
-        // Heartbeat (every 10s to be safe)
-        heartbeatInterval = setInterval(async () => {
-          // console.log(`[${reqId}] 💓 Sending Heartbeat`);
-          const success = await safeWrite(writer, encoder.encode(`: keep-alive ${Date.now()}\n\n`), reqId, "Heartbeat");
-          if (!success) {
-            console.warn(`[${reqId}] ⚠️ Heartbeat failed - clearing interval`);
-            clearInterval(heartbeatInterval);
-          }
-        }, 10000);
-
-        // Data Pump Loop
         while (true) {
+          if (req.signal.aborted) break; // Stop if client leaves
+
           const { done, value } = await reader.read();
-          
-          if (done) {
-            console.log(`[${reqId}] 🏁 Google Stream Complete. Total chunks: ${chunkCount}, Bytes: ${totalBytes}`);
-            break;
-          }
+          if (done) break;
 
-          chunkCount++;
-          if (value) {
-            totalBytes += value.byteLength;
-            // Log large chunks or every 10th chunk to keep logs sane
-            // if (chunkCount % 10 === 0 || value.byteLength > 1000) {
-            //   console.log(`[${reqId}] 📦 Chunk #${chunkCount} size: ${value.byteLength}`);
-            // }
-          }
-
-          // Write to client
-          const success = await safeWrite(writer, value, reqId, "DataChunk");
-          if (!success) {
-            console.warn(`[${reqId}] ⚠️ Client disconnected during stream. Stopping.`);
-            break;
-          }
+          // Write Data
+          const success = await safeWrite(value, "Data");
+          if (!success) break;
         }
-
-      } catch (e: any) {
-        console.error(`[${reqId}] ❌ Stream Loop Error:`, e);
-        // Try to notify client of error
-        await safeWrite(writer, encoder.encode(`data: {"error": "Proxy Stream Error: ${e.message}"}\n\n`), reqId, "ErrorNotification");
+      } catch (e) {
+        console.error(`[${reqId}] Stream Loop Error:`, e);
       } finally {
-        if (heartbeatInterval) clearInterval(heartbeatInterval);
-        console.log(`[${reqId}] 🔒 Closing Writer. Duration: ${(Date.now() - startTime) / 1000}s`);
+        clearInterval(heartbeat);
         try { await writer.close(); } catch (_) {}
+        // console.log(`[${reqId}] 🔒 Done.`);
       }
     })();
 
-    // 7. Return Response
+    // 6. Return Response
     const responseHeaders = new Headers(response.headers);
     Object.entries(CORS_HEADERS).forEach(([k, v]) => responseHeaders.set(k, v));
     responseHeaders.set("Content-Type", "text/event-stream");
     responseHeaders.set("Cache-Control", "no-cache");
     responseHeaders.set("Connection", "keep-alive");
-    
+
     return new Response(readable, {
       status: response.status,
-      statusText: response.statusText,
       headers: responseHeaders,
     });
 
   } catch (err: any) {
-    console.error(`[${reqId}] ❌ Fatal Handler Error:`, err);
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
-    });
+    console.error(`[${reqId}] Fatal:`, err);
+    return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: CORS_HEADERS });
   }
 });
