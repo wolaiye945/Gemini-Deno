@@ -7,18 +7,16 @@ const CORS_HEADERS = {
 };
 
 serve(async (req: Request) => {
-  // 1. Fast CORS
+  // 1. CORS
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: CORS_HEADERS });
   }
 
   try {
     const url = new URL(req.url);
-    
-    // 2. Build Upstream URL
     let targetPath = url.pathname;
     if (targetPath.startsWith("/models")) targetPath = "/v1beta" + targetPath;
-    
+
     const targetUrl = new URL(targetPath + url.search, "https://generativelanguage.googleapis.com");
     if (!targetUrl.searchParams.has("alt")) targetUrl.searchParams.set("alt", "sse");
 
@@ -26,14 +24,13 @@ serve(async (req: Request) => {
     newHeaders.set("Host", "generativelanguage.googleapis.com");
     newHeaders.delete("x-forwarded-for");
 
-    // 3. Fetch from Google
+    // 2. Fetch from Google
     const googleResponse = await fetch(targetUrl, {
       method: req.method,
       headers: newHeaders,
       body: req.method !== "GET" && req.method !== "HEAD" ? await req.text() : null,
     });
 
-    // 4. Handle Errors Immediately
     if (!googleResponse.ok) {
       return new Response(googleResponse.body, {
         status: googleResponse.status,
@@ -41,40 +38,73 @@ serve(async (req: Request) => {
       });
     }
 
-    // 5. Native Stream Transformation
-    // This is the magic fix. We don't loop manually. We define a transformer.
-    let started = false;
+    const reader = googleResponse.body?.getReader();
+    if (!reader) throw new Error("No body from Google");
+
     const encoder = new TextEncoder();
 
-    const transformer = new TransformStream({
-      start(controller) {
-        // Send SSE init immediately
+    // 3. Hybrid Stream (Speed + Stability)
+    const stream = new ReadableStream({
+      async start(controller) {
+        // Send Initial Start
         controller.enqueue(encoder.encode(": start\n\n"));
-        started = true;
+
+        // 4. heartbeat Loop
+        // This runs independently. It detects if 'lastRead' is old.
+        let lastRead = Date.now();
+        let closed = false;
+        
+        const hbInterval = setInterval(() => {
+            if (closed) {
+                clearInterval(hbInterval);
+                return;
+            }
+            // If we haven't read data in 9 seconds, send a heartbeat
+            if (Date.now() - lastRead > 9000) {
+                try {
+                    controller.enqueue(encoder.encode(`: keep-alive ${Date.now()}\n\n`));
+                } catch (e) {
+                    // Controller might be closed, cleanup
+                    clearInterval(hbInterval);
+                }
+            }
+        }, 3000); // Check every 3 seconds
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            
+            if (done) {
+              closed = true;
+              clearInterval(hbInterval);
+              controller.close();
+              break;
+            }
+
+            // Update activity timestamp
+            lastRead = Date.now();
+
+            // Pass data through immediately (Fast)
+            controller.enqueue(value);
+          }
+        } catch (err) {
+          closed = true;
+          clearInterval(hbInterval);
+          controller.error(err);
+        }
       },
-      transform(chunk, controller) {
-        // Pass the raw Google chunk directly to the client
-        // Zero processing, zero await lag
-        controller.enqueue(chunk);
-      },
-      flush(controller) {
-        // Optional: Send a final newline if needed, usually not required for SSE
+      cancel() {
+        // If client disconnects, kill the upstream reader
+        reader.cancel();
       }
     });
 
-    // 6. Construct the Pipeline
-    // googleResponse.body -> transformer -> Client
-    // We use the native .body property which is highly optimized
-    const stream = googleResponse.body?.pipeThrough(transformer);
-
-    // 7. Return the Response
+    // 5. Return Response
     const responseHeaders = new Headers(googleResponse.headers);
     Object.entries(CORS_HEADERS).forEach(([k, v]) => responseHeaders.set(k, v));
-    // Force SSE headers
     responseHeaders.set("Content-Type", "text/event-stream");
     responseHeaders.set("Cache-Control", "no-cache");
     responseHeaders.set("Connection", "keep-alive");
-    responseHeaders.delete("Content-Length"); // Ensure chunked encoding
 
     return new Response(stream, {
       status: googleResponse.status,
@@ -82,10 +112,6 @@ serve(async (req: Request) => {
     });
 
   } catch (err: any) {
-    console.error("Proxy Error:", err);
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
-    });
+    return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: CORS_HEADERS });
   }
 });
